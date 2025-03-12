@@ -29,6 +29,12 @@ from crawl4ai.content_filter_strategy import (
 )
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 from crawl4ai.content_scraping_strategy import LXMLWebScrapingStrategy
+from crawl4ai.deep_crawling import (
+    BFSDeepCrawlStrategy,
+    DFSDeepCrawlStrategy,
+    BestFirstCrawlingStrategy
+)
+from crawl4ai.deep_crawling.scorers import KeywordRelevanceScorer
 
 from utils import (
     TaskStatus,
@@ -441,6 +447,123 @@ async def handle_stream_crawl_request(
         if 'crawler' in locals():
             await crawler.close()
         logger.error(f"Stream crawl error: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+async def handle_deep_crawl_request(
+    urls: List[str],
+    browser_config: dict,
+    crawler_config: dict,
+    deep_crawl_strategy: str,
+    max_depth: int,
+    include_external: bool,
+    config: dict,
+    max_pages: Optional[int] = None,
+    score_threshold: Optional[float] = None,
+    keywords: Optional[List[str]] = None,
+    keyword_weight: Optional[float] = None
+) -> dict:
+    """Handle deep crawling requests.
+    
+    Args:
+        urls: List of URLs to crawl
+        browser_config: Browser configuration
+        crawler_config: Crawler configuration
+        deep_crawl_strategy: The strategy to use (BFS, DFS, or BestFirst)
+        max_depth: Maximum depth to crawl
+        include_external: Whether to include external links
+        config: Application configuration
+        max_pages: Maximum number of pages to crawl
+        score_threshold: Minimum score for URLs to be crawled (only used with BestFirst)
+        keywords: Keywords for relevance scoring (only used with BestFirst)
+        keyword_weight: Weight for keyword relevance (only used with BestFirst)
+        
+    Returns:
+        Dictionary containing crawl results
+    """
+    try:
+        browser_config = BrowserConfig.load(browser_config)
+        crawler_config = CrawlerRunConfig.load(crawler_config)
+        
+        # Configure the deep crawl strategy based on the request
+        if deep_crawl_strategy == "BFS":
+            strategy = BFSDeepCrawlStrategy(
+                max_depth=max_depth,
+                include_external=include_external,
+                max_pages=max_pages,
+                score_threshold=score_threshold
+            )
+        elif deep_crawl_strategy == "DFS":
+            strategy = DFSDeepCrawlStrategy(
+                max_depth=max_depth,
+                include_external=include_external,
+                max_pages=max_pages,
+                score_threshold=score_threshold
+            )
+        elif deep_crawl_strategy == "BestFirst":
+            # For BestFirst, we need a scorer
+            scorer = None
+            if keywords:
+                scorer = KeywordRelevanceScorer(
+                    keywords=keywords,
+                    weight=keyword_weight or 0.7
+                )
+                
+            strategy = BestFirstCrawlingStrategy(
+                max_depth=max_depth,
+                include_external=include_external,
+                max_pages=max_pages,
+                url_scorer=scorer
+            )
+        else:
+            raise ValueError(f"Invalid deep crawl strategy: {deep_crawl_strategy}")
+        
+        # Set the deep crawl strategy in the crawler config
+        crawler_config.deep_crawl_strategy = strategy
+        crawler_config.scraping_strategy = LXMLWebScrapingStrategy()
+        
+        dispatcher = MemoryAdaptiveDispatcher(
+            memory_threshold_percent=config["crawler"]["memory_threshold_percent"],
+            rate_limiter=RateLimiter(
+                base_delay=tuple(config["crawler"]["rate_limiter"]["base_delay"])
+            )
+        )
+        
+        crawler_config.stream = True
+        
+        # crawler_config = CrawlerRunConfig(
+        #     deep_crawl_strategy=BFSDeepCrawlStrategy(
+        #         max_depth=2, 
+        #         include_external=False
+        #     ),
+        #     scraping_strategy=LXMLWebScrapingStrategy(),
+        #     verbose=True,
+        #     stream=True
+        # )
+        
+        async with AsyncWebCrawler(config=browser_config) as crawler:
+            # Use arun_many to process all URLs
+            results = await crawler.arun(
+                url=urls[0],
+                config=crawler_config,
+                dispatcher=dispatcher
+            )
+
+            processed_results = []
+            
+            async for result in results:
+                print(result)
+                processed_results.append(result)
+            
+            return {
+                "success": True,
+                "results": [result.model_dump() for result in processed_results]
+            }
+            
+    except Exception as e:
+        logger.error(f"Deep crawl error: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)

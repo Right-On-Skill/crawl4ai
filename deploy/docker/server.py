@@ -1,7 +1,8 @@
+import math
 import os
 import sys
 import time
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Literal
 from fastapi import FastAPI, HTTPException, Request, Query, Path, Depends
 from fastapi.responses import StreamingResponse, RedirectResponse, PlainTextResponse, JSONResponse
 from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
@@ -19,6 +20,7 @@ from api import (
     handle_llm_qa,
     handle_stream_crawl_request,
     handle_crawl_request,
+    handle_deep_crawl_request,
     stream_results
 )
 from auth import create_access_token, get_token_dependency, TokenRequest  # Import from auth.py
@@ -26,9 +28,45 @@ from auth import create_access_token, get_token_dependency, TokenRequest  # Impo
 __version__ = "0.2.6"
 
 class CrawlRequest(BaseModel):
-    urls: List[str] = Field(min_length=1, max_length=100)
+    url: str = Field(..., description="The URL to crawl")
     browser_config: Optional[Dict] = Field(default_factory=dict)
     crawler_config: Optional[Dict] = Field(default_factory=dict)
+
+class DeepCrawlRequest(CrawlRequest):
+    deep_crawl_strategy: Literal["BFS", "DFS", "BestFirst"] = Field(
+        default="BFS", 
+        description="The deep crawling strategy to use: BFS (Breadth-First Search), DFS (Depth-First Search), or BestFirst"
+    )
+    max_depth: int = Field(
+        default=2, 
+        ge=1, 
+        le=5, 
+        description="Maximum depth to crawl (1-5)"
+    )
+    include_external: bool = Field(
+        default=False, 
+        description="Whether to include external links (links to other domains)"
+    )
+    max_pages: Optional[int] = Field(
+        default=math.inf, 
+        ge=1, 
+        le=500, 
+        description="Maximum number of pages to crawl (1-500)"
+    )
+    score_threshold: Optional[float] = Field(
+        default=-math.inf, 
+        description="Minimum score for URLs to be crawled (only used with BestFirst strategy)"
+    )
+    keywords: Optional[List[str]] = Field(
+        default=None, 
+        description="Keywords for relevance scoring (only used with BestFirst strategy)"
+    )
+    keyword_weight: Optional[float] = Field(
+        default=0.7, 
+        ge=0.0, 
+        le=1.0, 
+        description="Weight for keyword relevance (only used with BestFirst strategy)"
+    )
 
 # Load configuration and setup
 config = load_config()
@@ -146,7 +184,6 @@ async def crawl(
 
     return JSONResponse(results)
 
-
 @app.post("/crawl/stream")
 @limiter.limit(config["rate_limiting"]["default_limit"])
 async def crawl_stream(
@@ -169,6 +206,48 @@ async def crawl_stream(
         media_type='application/x-ndjson',
         headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Stream-Status': 'active'}
     )
+
+@app.post("/deep-crawl", description="Deep crawl a website with configurable strategy (BFS, DFS, or BestFirst)")
+@limiter.limit(config["rate_limiting"]["default_limit"])
+async def deep_crawl(
+    request: Request,
+    crawl_request: DeepCrawlRequest,
+    token_data: Optional[Dict] = Depends(token_dependency)
+):
+    """Deep crawl endpoint that explores websites beyond a single page.
+    
+    This endpoint allows configuring the crawling strategy (BFS, DFS, or BestFirst),
+    depth, and other parameters to control the crawl behavior.
+    
+    - BFS (Breadth-First Search): Explores all links at one depth before moving deeper
+    - DFS (Depth-First Search): Explores as far down a branch as possible before backtracking
+    - BestFirst: Prioritizes pages based on relevance to specified keywords
+    """
+    if not crawl_request.url:
+        raise HTTPException(status_code=400, detail="A URL required")
+    
+    # Validate BestFirst strategy requirements
+    if crawl_request.deep_crawl_strategy == "BestFirst" and not crawl_request.keywords:
+        raise HTTPException(
+            status_code=400, 
+            detail="Keywords are required for BestFirst crawling strategy"
+        )
+    
+    results = await handle_deep_crawl_request(
+        urls=[crawl_request.url],
+        browser_config=crawl_request.browser_config,
+        crawler_config=crawl_request.crawler_config,
+        deep_crawl_strategy=crawl_request.deep_crawl_strategy,
+        max_depth=crawl_request.max_depth,
+        include_external=crawl_request.include_external,
+        config=config,
+        max_pages=crawl_request.max_pages,
+        score_threshold=crawl_request.score_threshold,
+        keywords=crawl_request.keywords,
+        keyword_weight=crawl_request.keyword_weight
+    )
+
+    return JSONResponse(results)
 
 if __name__ == "__main__":
     import uvicorn
